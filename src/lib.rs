@@ -10,19 +10,27 @@ use winit::{
     window::{Window, WindowId},
 };
 
-const TRI: [([f32; 3], [f32; 3]); 3] = [
+const TRIANGLE_VERTICES: [([f32; 3], [f32; 3]); 3] = [
     ([1., -1., 0.], [1., 0., 0.]),
     ([-1., -1., 0.], [0., 1., 0.]),
     ([0., 1., 0.], [0., 0., 1.]),
 ];
+
 const SHADER: &str = "
-struct O{@builtin(position)p:vec4<f32>,@location(0)c:vec4<f32>}
-@vertex fn vs(@location(0)p:vec4<f32>,@location(1)c:vec4<f32>)->O{return O(p,c);}
-@fragment fn fs(o:O)->@location(0)vec4<f32>{return o.c;}
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+}
+@vertex fn vs(@location(0) position: vec4<f32>, @location(1) color: vec4<f32>) -> VertexOutput {
+    return VertexOutput(position, color);
+}
+@fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
 ";
 
 #[cfg(target_arch = "wasm32")]
-fn cv() -> wgpu::web_sys::HtmlCanvasElement {
+fn get_canvas() -> wgpu::web_sys::HtmlCanvasElement {
     wgpu::web_sys::window()
         .unwrap()
         .document()
@@ -33,70 +41,72 @@ fn cv() -> wgpu::web_sys::HtmlCanvasElement {
         .unwrap()
 }
 
-struct G {
-    w: Arc<Window>,
-    s: wgpu::Surface<'static>,
-    d: wgpu::Device,
-    q: wgpu::Queue,
-    cfg: wgpu::SurfaceConfiguration,
-    p: wgpu::RenderPipeline,
-    vb: wgpu::Buffer,
-    er: egui_wgpu::Renderer,
-    es: egui_winit::State,
-    m: nalgebra_glm::Mat4,
-    t: Instant,
-    sz: (u32, u32),
+struct Graphics {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface_config: wgpu::SurfaceConfiguration,
+    pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    egui_renderer: egui_wgpu::Renderer,
+    egui_state: egui_winit::State,
+    rotation: nalgebra_glm::Mat4,
+    last_frame: Instant,
+    size: (u32, u32),
 }
 
 #[derive(Default)]
 pub struct App {
-    g: Option<G>,
+    graphics: Option<Graphics>,
     #[cfg(target_arch = "wasm32")]
-    rx: Option<futures::channel::oneshot::Receiver<G>>,
+    pending: Option<futures::channel::oneshot::Receiver<Graphics>>,
 }
 
-async fn init(w: Arc<Window>, aw: u32, ah: u32) -> G {
-    let i = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-    let s = i.create_surface(w.clone()).unwrap();
-    let a = i
+async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let surface = instance.create_surface(window.clone()).unwrap();
+    let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: Some(&s),
+            compatible_surface: Some(&surface),
             ..Default::default()
         })
         .await
         .unwrap();
-    let (d, q) = a
+    let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
-            required_limits: wgpu::Limits::default().using_resolution(a.limits()),
+            required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
             ..Default::default()
         })
         .await
         .unwrap();
-    let cfg = s.get_default_config(&a, aw, ah).unwrap();
-    s.configure(&d, &cfg);
-    let sh = d.create_shader_module(wgpu::ShaderModuleDescriptor {
+    let surface_config = surface.get_default_config(&adapter, width, height).unwrap();
+    surface.configure(&device, &surface_config);
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
     });
-    let at = wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4];
-    let p = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
         layout: None,
         vertex: wgpu::VertexState {
-            module: &sh,
+            module: &shader,
             entry_point: Some("vs"),
             compilation_options: Default::default(),
             buffers: &[wgpu::VertexBufferLayout {
                 array_stride: 32,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &at,
+                attributes: &vertex_attrs,
             }],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &sh,
+            module: &shader,
             entry_point: Some("fs"),
             compilation_options: Default::default(),
-            targets: &[Some(cfg.format.into())],
+            targets: &[Some(surface_config.format.into())],
         }),
         primitive: Default::default(),
         depth_stencil: None,
@@ -104,115 +114,169 @@ async fn init(w: Arc<Window>, aw: u32, ah: u32) -> G {
         multiview_mask: None,
         cache: None,
     });
-    let vb = d.create_buffer(&wgpu::BufferDescriptor {
+
+    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 96,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let er = egui_wgpu::Renderer::new(
-        &d,
-        cfg.format,
+
+    let egui_renderer = egui_wgpu::Renderer::new(
+        &device,
+        surface_config.format,
         egui_wgpu::RendererOptions {
             msaa_samples: 1,
             ..Default::default()
         },
     );
-    let ctx = egui::Context::default();
-    let es = egui_winit::State::new(ctx, egui::ViewportId::ROOT, &w, None, None, None);
-    G {
-        w,
-        s,
-        d,
-        q,
-        cfg,
-        p,
-        vb,
-        er,
-        es,
-        m: nalgebra_glm::Mat4::identity(),
-        t: Instant::now(),
-        sz: (aw, ah),
+    let egui_context = egui::Context::default();
+    let egui_state = egui_winit::State::new(
+        egui_context,
+        egui::ViewportId::ROOT,
+        &window,
+        None,
+        None,
+        None,
+    );
+
+    Graphics {
+        window,
+        surface,
+        device,
+        queue,
+        surface_config,
+        pipeline,
+        vertex_buffer,
+        egui_renderer,
+        egui_state,
+        rotation: nalgebra_glm::Mat4::identity(),
+        last_frame: Instant::now(),
+        size: (width, height),
     }
 }
 
-fn resize(g: &mut G, w: u32, h: u32) {
-    (g.sz, g.cfg.width, g.cfg.height) = ((w, h), w, h);
-    g.s.configure(&g.d, &g.cfg);
+fn resize(graphics: &mut Graphics, width: u32, height: u32) {
+    graphics.size = (width, height);
+    graphics.surface_config.width = width;
+    graphics.surface_config.height = height;
+    graphics
+        .surface
+        .configure(&graphics.device, &graphics.surface_config);
 }
 
-fn render(g: &mut G) {
+fn render(graphics: &mut Graphics) {
     let now = Instant::now();
-    let dt = (now - g.t).as_secs_f32();
-    g.t = now;
+    let dt = (now - graphics.last_frame).as_secs_f32();
+    graphics.last_frame = now;
+
     #[cfg(target_arch = "wasm32")]
     {
-        let c = cv();
-        if c.width() > 0 && c.height() > 0 && (c.width(), c.height()) != g.sz {
-            resize(g, c.width(), c.height());
+        let canvas = get_canvas();
+        if canvas.width() > 0
+            && canvas.height() > 0
+            && (canvas.width(), canvas.height()) != graphics.size
+        {
+            resize(graphics, canvas.width(), canvas.height());
         }
     }
-    let (w, h) = g.sz;
+
+    let (width, height) = graphics.size;
+
     #[cfg(not(target_arch = "wasm32"))]
-    let inp = g.es.take_egui_input(&g.w);
+    let egui_input = graphics.egui_state.take_egui_input(&graphics.window);
     #[cfg(target_arch = "wasm32")]
-    let mut inp = g.es.take_egui_input(&g.w);
+    let mut egui_input = graphics.egui_state.take_egui_input(&graphics.window);
     #[cfg(target_arch = "wasm32")]
     {
-        let ppp = g.es.egui_ctx().pixels_per_point();
-        inp.screen_rect = Some(egui::Rect::from_min_size(
+        let ppp = graphics.egui_state.egui_ctx().pixels_per_point();
+        egui_input.screen_rect = Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(w as f32 / ppp, h as f32 / ppp),
+            egui::vec2(width as f32 / ppp, height as f32 / ppp),
         ));
     }
-    let o = g.es.egui_ctx().run_ui(inp, |ui| {
+
+    let egui_output = graphics.egui_state.egui_ctx().run_ui(egui_input, |ui| {
         egui::Window::new("wgpu+egui").show(ui.ctx(), |ui| {
             ui.label("Spinning triangle");
             ui.label(format!("{:.0}fps", 1. / dt.max(1e-6)));
         });
     });
-    g.es.handle_platform_output(&g.w, o.platform_output);
-    let jobs = g.es.egui_ctx().tessellate(o.shapes, o.pixels_per_point);
-    let dsc = egui_wgpu::ScreenDescriptor {
-        size_in_pixels: [w, h],
-        pixels_per_point: o.pixels_per_point,
+    graphics
+        .egui_state
+        .handle_platform_output(&graphics.window, egui_output.platform_output);
+
+    let paint_jobs = graphics
+        .egui_state
+        .egui_ctx()
+        .tessellate(egui_output.shapes, egui_output.pixels_per_point);
+    let screen_descriptor = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [width, height],
+        pixels_per_point: egui_output.pixels_per_point,
     };
-    for (id, d) in &o.textures_delta.set {
-        g.er.update_texture(&g.d, &g.q, *id, d);
+
+    for (id, delta) in &egui_output.textures_delta.set {
+        graphics
+            .egui_renderer
+            .update_texture(&graphics.device, &graphics.queue, *id, delta);
     }
-    for id in &o.textures_delta.free {
-        g.er.free_texture(id);
+    for id in &egui_output.textures_delta.free {
+        graphics.egui_renderer.free_texture(id);
     }
-    g.m = nalgebra_glm::rotate(&g.m, 30f32.to_radians() * dt, &nalgebra_glm::Vec3::y());
-    let mvp =
-        nalgebra_glm::perspective_lh_zo(w as f32 / h.max(1) as f32, 80f32.to_radians(), 0.1, 1e3)
-            * nalgebra_glm::look_at_lh(
-                &nalgebra_glm::vec3(0., 0., 3.),
-                &nalgebra_glm::vec3(0., 0., 0.),
-                &nalgebra_glm::Vec3::y(),
-            )
-            * g.m;
-    let mut vd = [0f32; 24];
-    for (i, (p, c)) in TRI.iter().enumerate() {
-        let v = mvp * nalgebra_glm::vec4(p[0], p[1], p[2], 1.);
-        vd[i * 8..i * 8 + 8].copy_from_slice(&[v.x, v.y, v.z, v.w, c[0], c[1], c[2], 1.]);
+
+    graphics.rotation = nalgebra_glm::rotate(
+        &graphics.rotation,
+        30f32.to_radians() * dt,
+        &nalgebra_glm::Vec3::y(),
+    );
+    let mvp = nalgebra_glm::perspective_lh_zo(
+        width as f32 / height.max(1) as f32,
+        80f32.to_radians(),
+        0.1,
+        1e3,
+    ) * nalgebra_glm::look_at_lh(
+        &nalgebra_glm::vec3(0., 0., 3.),
+        &nalgebra_glm::vec3(0., 0., 0.),
+        &nalgebra_glm::Vec3::y(),
+    ) * graphics.rotation;
+
+    let mut vertex_data = [0f32; 24];
+    for (i, (pos, color)) in TRIANGLE_VERTICES.iter().enumerate() {
+        let clip = mvp * nalgebra_glm::vec4(pos[0], pos[1], pos[2], 1.);
+        vertex_data[i * 8..i * 8 + 8].copy_from_slice(&[
+            clip.x, clip.y, clip.z, clip.w, color[0], color[1], color[2], 1.,
+        ]);
     }
-    g.q.write_buffer(&g.vb, 0, bytemuck::cast_slice(&vd));
-    let mut enc = g.d.create_command_encoder(&Default::default());
-    g.er.update_buffers(&g.d, &g.q, &mut enc, &jobs, &dsc);
+    graphics.queue.write_buffer(
+        &graphics.vertex_buffer,
+        0,
+        bytemuck::cast_slice(&vertex_data),
+    );
+
+    let mut encoder = graphics.device.create_command_encoder(&Default::default());
+    graphics.egui_renderer.update_buffers(
+        &graphics.device,
+        &graphics.queue,
+        &mut encoder,
+        &paint_jobs,
+        &screen_descriptor,
+    );
+
     let frame = loop {
-        match g.s.get_current_texture() {
+        match graphics.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => break f,
-            wgpu::CurrentSurfaceTexture::Outdated => g.s.configure(&g.d, &g.cfg),
-            o => panic!("{o:?}"),
+            wgpu::CurrentSurfaceTexture::Outdated => graphics
+                .surface
+                .configure(&graphics.device, &graphics.surface_config),
+            other => panic!("{other:?}"),
         }
     };
-    let tv = frame.texture.create_view(&Default::default());
+    let frame_view = frame.texture.create_view(&Default::default());
     {
-        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &tv,
+                view: &frame_view,
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
@@ -227,62 +291,81 @@ fn render(g: &mut G) {
             })],
             ..Default::default()
         });
-        pass.set_pipeline(&g.p);
-        pass.set_vertex_buffer(0, g.vb.slice(..));
+        pass.set_pipeline(&graphics.pipeline);
+        pass.set_vertex_buffer(0, graphics.vertex_buffer.slice(..));
         pass.draw(0..3, 0..1);
-        g.er.render(&mut pass.forget_lifetime(), &jobs, &dsc);
+        graphics
+            .egui_renderer
+            .render(&mut pass.forget_lifetime(), &paint_jobs, &screen_descriptor);
     }
-    g.q.submit([enc.finish()]);
+    graphics.queue.submit([encoder.finish()]);
     frame.present();
 }
 
 impl ApplicationHandler for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.g.is_some() {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.graphics.is_some() {
             return;
         }
+
         #[cfg(not(target_arch = "wasm32"))]
-        let attrs = Window::default_attributes();
+        let window_attrs = Window::default_attributes();
         #[cfg(target_arch = "wasm32")]
-        let (attrs, cw, ch) = {
+        let (window_attrs, canvas_width, canvas_height) = {
             use winit::platform::web::WindowAttributesExtWebSys;
-            let c = cv();
-            let (w, h) = (c.width(), c.height());
-            (Window::default_attributes().with_canvas(Some(c)), w, h)
+            let canvas = get_canvas();
+            let (w, h) = (canvas.width(), canvas.height());
+            (Window::default_attributes().with_canvas(Some(canvas)), w, h)
         };
-        let win = Arc::new(el.create_window(attrs).unwrap());
+
+        let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = env_logger::try_init();
-            let s = win.inner_size();
-            self.g = Some(pollster::block_on(init(win, s.width, s.height)));
+            let size = window.inner_size();
+            self.graphics = Some(pollster::block_on(init_graphics(
+                window,
+                size.width,
+                size.height,
+            )));
         }
         #[cfg(target_arch = "wasm32")]
         {
             console_error_panic_hook::set_once();
             let _ = console_log::init();
-            let (tx, rx) = futures::channel::oneshot::channel();
-            self.rx = Some(rx);
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            self.pending = Some(receiver);
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = tx.send(init(win, cw, ch).await);
+                let _ = sender.send(init_graphics(window, canvas_width, canvas_height).await);
             });
         }
     }
-    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         #[cfg(target_arch = "wasm32")]
-        if let Some(rx) = self.rx.as_mut()
-            && let Ok(Some(g)) = rx.try_recv()
+        if let Some(receiver) = self.pending.as_mut()
+            && let Ok(Some(graphics)) = receiver.try_recv()
         {
-            g.w.request_redraw();
-            self.g = Some(g);
-            self.rx = None;
+            graphics.window.request_redraw();
+            self.graphics = Some(graphics);
+            self.pending = None;
         }
-        let Some(g) = self.g.as_mut() else { return };
-        if g.es.on_window_event(&g.w, &ev).consumed {
-            g.w.request_redraw();
+
+        let Some(graphics) = self.graphics.as_mut() else {
+            return;
+        };
+
+        if graphics
+            .egui_state
+            .on_window_event(&graphics.window, &event)
+            .consumed
+        {
+            graphics.window.request_redraw();
             return;
         }
-        match ev {
+
+        match event {
             WindowEvent::CloseRequested
             | WindowEvent::KeyboardInput {
                 event:
@@ -291,11 +374,13 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => el.exit(),
-            WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => resize(g, s.width, s.height),
+            } => event_loop.exit(),
+            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
+                resize(graphics, size.width, size.height);
+            }
             WindowEvent::RedrawRequested => {
-                render(g);
-                g.w.request_redraw();
+                render(graphics);
+                graphics.window.request_redraw();
             }
             _ => {}
         }
